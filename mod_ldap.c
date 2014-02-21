@@ -376,6 +376,7 @@ static int pr_ldap_connect(LDAP **conn_ld, int do_bind) {
   return -1;
 }
 
+
 static char *
 pr_ldap_interpolate_filter(pool *p, char *template, const char *value)
 {
@@ -405,11 +406,81 @@ pr_ldap_interpolate_filter(pool *p, char *template, const char *value)
   return filter;
 }
 
+/* Returns 0 if there are more OU's than the position index, or
+ *         >0 if reached the end of the list */
+int find_OU(const char *basedn, int position, char *temp)
+{
+  int i = 0;
+  char* begin = NULL;
+  char* end = NULL;
+  int is_last = 0;
+  int ou_count = -1;
+
+  if (position < 0) {
+    temp[0] = '\0';
+    return 2;
+  }
+
+  for (i=0; ; ++i) {
+    if (basedn[i] == '=') {
+      begin = &basedn[i+1];
+      break;
+    }
+  }
+  int contador = 0;
+  // aqui achou o inicio do OU
+  do {
+    ++ou_count;
+    for (i=0; ; ++i) {
+      if (begin[i] == '|') {
+        end = &begin[i];
+        if (position != ou_count) {
+          begin = end + 1;
+        }
+        break;
+      } else if (begin[i] == ',' || begin[i] == '\0') {
+        is_last = 1;
+        if (position == ou_count) {
+          end = &begin[i];
+        } else {
+          temp[0] = '\0';
+          return 1;
+        }
+        break;
+      }
+    }
+    ++contador;
+  } while ((is_last == 0) && (position > ou_count) && (contador < 50));
+  //strncpy(temp, begin, end-begin);
+  snprintf(temp, end-begin+4, "ou=%s", begin);
+  temp[end-begin+4] = '\0';
+  return is_last;
+}
+
+char* append_remaining_base(const char *basedn, char* temp) {
+  int base_i = 0;
+  int temp_i = 0;
+
+  while (temp[temp_i] != '\0') {
+    ++temp_i;
+  }
+  while (basedn[base_i] != ',') {
+    ++base_i;
+  }
+  while (basedn[base_i] != '\0') {
+    temp[temp_i] = basedn[base_i];
+    ++temp_i;
+    ++base_i;
+  }
+  temp[temp_i] = '\0';
+  return temp;
+}
+
 static LDAPMessage *
 pr_ldap_search(char *basedn, char *filter, char *attrs[], int sizelimit,
                int retry)
 {
-  int ret;
+  int ret; 
   LDAPMessage *result;
 
   if (!basedn) {
@@ -418,13 +489,13 @@ pr_ldap_search(char *basedn, char *filter, char *attrs[], int sizelimit,
   }
 
   /* If the LDAP connection has gone away or hasn't been established
-   * yet, attempt to establish it now.
-   */
+ *    * yet, attempt to establish it now. 
+ *       */   
   if (ld == NULL) {
     /* If we _still_ can't connect, give up and return NULL. */
     if (pr_ldap_connect(&ld, TRUE) == -1) {
       return NULL;
-    }
+    }    
   }
 
   ret = LDAP_SEARCH(ld, basedn, ldap_search_scope, filter, attrs,
@@ -433,13 +504,13 @@ pr_ldap_search(char *basedn, char *filter, char *attrs[], int sizelimit,
     if (ret != LDAP_SERVER_DOWN) {
       pr_log_pri(PR_LOG_ERR, MOD_LDAP_VERSION ": pr_ldap_search(): LDAP search failed: %s", ldap_err2string(ret));
       return NULL;
-    }
+    }    
 
     if (!retry) {
       pr_log_pri(PR_LOG_ERR, MOD_LDAP_VERSION ": pr_ldap_search(): LDAP connection went away, search failed.");
       pr_ldap_unbind();
       return NULL;
-    }
+    }    
 
     pr_log_pri(PR_LOG_ERR, MOD_LDAP_VERSION ": pr_ldap_search(): LDAP connection went away, retrying search operation...");
     pr_ldap_unbind();
@@ -964,9 +1035,24 @@ pr_ldap_getpwnam(pool *p, const char *username)
    * fetched userPassword, auth binds would never be done because
    * handle_ldap_check() would always get a crypted password.
    */
-  return pr_ldap_user_lookup(p, ldap_user_name_filter, username, filter,
+
+  char filter_temp[1000];
+  int ou_count = 0;
+  int finished = 0;
+  do {
+    finished = find_OU(filter, ou_count, filter_temp);
+    ++ou_count;
+    append_remaining_base(filter, filter_temp);
+    pr_log_debug(PR_LOG_ERR, MOD_LDAP_VERSION " Trying filter: %s", filter_temp);
+
+    struct passwd* result = pr_ldap_user_lookup(p, ldap_user_name_filter, username, filter_temp,
     ldap_authbinds ? name_attrs + 1 : name_attrs,
     ldap_authbinds ? &ldap_authbind_dn : NULL);
+    if (result != NULL) {
+      return result;
+    }
+  } while (finished == 0);
+  return NULL;
 }
 
 static struct passwd *
@@ -1017,7 +1103,7 @@ handle_ldap_ssh_pubkey_lookup(cmd_rec *cmd)
     return PR_DECLINED(cmd);
   }
 
-  if (cached_ssh_pubkeys != NULL &&
+  if (cached_ssh_pubkeys != NULL ||
       strcasecmp(((char **)cached_ssh_pubkeys->elts)[0], cmd->argv[0]) == 0) {
 
     pr_log_debug(DEBUG3, MOD_LDAP_VERSION ": returning cached SSH public keys for %s", cmd->argv[0]);
@@ -1243,35 +1329,63 @@ handle_ldap_is_auth(cmd_rec *cmd)
     return NULL;
   }
 
-  /* If anything here fails hard (IOW, we've found an LDAP entry for the
-   * user, but they appear to have entered the wrong password), fail auth.
-   * Normally, I'd DECLINE here so other modules could have a shot, but if
-   * we've found their LDAP entry, chances are that nothing else will be
-   * able to auth them.
-   */
 
-  pw = pr_ldap_user_lookup(cmd->tmp_pool,
-    ldap_user_name_filter, username, filter,
-    ldap_authbinds ? pass_attrs + 1 : pass_attrs,
-    ldap_authbinds ? &ldap_authbind_dn : NULL);
-  if (!pw) {
-    return PR_DECLINED(cmd); /* Can't find the user in the LDAP directory. */
+   // OU format = "ou=brasil|argentina|espanha,dc=corp,dc=terra"
+  char filter_temp[1000];
+  int ou_count = 0; 
+  int finished = 0; 
+  int success = 0;
+  do { 
+    finished = find_OU(filter, ou_count, filter_temp);
+    ++ou_count;
+    append_remaining_base(filter, filter_temp);
+
+    /* If anything here fails hard (IOW, we've found an LDAP entry for the
+     * user, but they appear to have entered the wrong password), fail auth.
+     * Normally, I'd DECLINE here so other modules could have a shot, but if
+     * we've found their LDAP entry, chances are that nothing else will be
+     * able to auth them.
+     */
+
+    pw = pr_ldap_user_lookup(cmd->tmp_pool,
+      ldap_user_name_filter, username, filter_temp,
+      ldap_authbinds ? pass_attrs + 1 : pass_attrs,
+      ldap_authbinds ? &ldap_authbind_dn : NULL);
+    if (!pw) {
+      continue;
+    }
+
+    if (!ldap_authbinds && !pw->pw_passwd) {
+      continue;
+    }
+
+    if (pr_auth_check(cmd->tmp_pool, ldap_authbinds ? NULL : pw->pw_passwd,
+                      username, cmd->argv[1]))
+    {
+      continue;
+    }
+    success = 1;
+    break;
+  } while (finished == 0);
+
+  if (success != 0) {
+    session.auth_mech = "mod_ldap.c";
+    return PR_HANDLED(cmd);
+  } else {
+    if (!pw) {
+      return PR_DECLINED(cmd); /* Can't find the user in the LDAP directory. */
+    }
+    if (!ldap_authbinds && !pw->pw_passwd) {
+      pr_log_debug(DEBUG3, MOD_LDAP_VERSION ": LDAPAuthBinds is not enabled, and couldn't fetch a password for %s", pw->pw_name);
+      return PR_ERROR_INT(cmd, PR_AUTH_NOPWD);
+    }
+    if (pr_auth_check(cmd->tmp_pool, ldap_authbinds ? NULL : pw->pw_passwd,
+                      username, cmd->argv[1])) {
+      pr_log_debug(DEBUG3, MOD_LDAP_VERSION ": bad password for %s", pw->pw_name);
+      return PR_ERROR_INT(cmd, PR_AUTH_BADPWD);
+    }
   }
-
-  if (!ldap_authbinds && !pw->pw_passwd) {
-    pr_log_debug(DEBUG3, MOD_LDAP_VERSION ": LDAPAuthBinds is not enabled, and couldn't fetch a password for %s", pw->pw_name);
-    return PR_ERROR_INT(cmd, PR_AUTH_NOPWD);
-  }
-
-  if (pr_auth_check(cmd->tmp_pool, ldap_authbinds ? NULL : pw->pw_passwd,
-                    username, cmd->argv[1]))
-  {
-    pr_log_debug(DEBUG3, MOD_LDAP_VERSION ": bad password for %s", pw->pw_name);
-    return PR_ERROR_INT(cmd, PR_AUTH_BADPWD);
-  }
-
-  session.auth_mech = "mod_ldap.c";
-  return PR_HANDLED(cmd);
+  return NULL;
 }
 
 /* cmd->argv[0] = hashed password,
@@ -2153,3 +2267,4 @@ module ldap_module = {
   ldap_getconf,
   MOD_LDAP_VERSION
 };
+
