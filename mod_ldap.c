@@ -1330,7 +1330,6 @@ handle_ldap_is_auth(cmd_rec *cmd)
   }
 
 
-   // OU format = "ou=brasil|argentina|espanha,dc=corp,dc=terra"
   char filter_temp[1000];
   int ou_count = 0; 
   int finished = 0; 
